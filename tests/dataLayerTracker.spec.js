@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const DataLayerTracker = require('../lib/data-layer-tracker');
+const DataLayerTracker = require('../modules/dataLayerTracker');
 
 // Grouping all tests related to the DataLayerTracker behaviour
 test.describe('DataLayerTracker behaviour', () => {
