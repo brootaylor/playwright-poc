@@ -1,98 +1,118 @@
-// modules/dataLayerTracker.js
+// dataLayerTracker.js
+// ---------------------------------
+// To be used by the Playwright test suite
+// An attempt anyway :-)
 
-/**
- * A Playwright helper class that:
- * - Intercepts all dataLayer.push() calls in the browser context
- * - Stores pushed events per full URL (origin + pathname + search)
- * - Allows re-injection of those events when navigating back
- */
 class DataLayerTracker {
-  constructor(page) {
-    this.page = page;
+    constructor(page) {
+        this.page = page; // Meant to represent the current Playwright (Node-based) browser tab/page
+        this.dataLayerHistory = {}; // Empty object to store captured `dataLayer.push()` values
+    }
 
     /**
-     * Maps full URLs to arrays of dataLayer events
-     * e.g., {
-     *   "https://example.com/page1?ref=abc": [ { event: "click" }, ... ]
-     * }
+     * - Exposing a Node callback (`capturePush`) to the browser context
+     * - Injecting a wrapper around `dataLayer.push` in the browser
      */
-    this.dataLayerHistory = {};
-  }
+    async init() {
+        await this.page.exposeFunction('capturePush', (event) => {
+            const url = this._getPagePathname(); // Grab only the pathname of the URL
 
-  /**
-   * Call this once after navigating to your first page.
-   * It sets up the tracking infrastructure:
-   * - Exposes a capture function to browser context
-   * - Injects a wrapper for dataLayer.push
-   */
-  async init() {
-    await this.page.exposeFunction('capturePush', (event) => {
-      const url = this._getCurrentPageUrl();
-      if (!this.dataLayerHistory[url]) {
-        this.dataLayerHistory[url] = [];
-      }
-      this.dataLayerHistory[url].push(event);
-    });
+            if (!this.dataLayerHistory[url]) {
+                this.dataLayerHistory[url] = [];
+            }
 
-    await this.injectPushInterceptor();
-  }
+            this.dataLayerHistory[url].push(event); // Save each push for this page
+            console.log(`[GTM Tracker] Captured dataLayer.push on ${url}`, event); // Logging what data is captured
+        });
 
-  /**
-   * Injects a wrapper function for dataLayer.push inside the browser.
-   * Ensures it doesn't double-wrap.
-   */
-  async injectPushInterceptor() {
-    await this.page.evaluate(() => {
-      if (!window.dataLayer || !Array.isArray(window.dataLayer)) {
-        window.dataLayer = [];
-      }
+        // Inject the actual push interceptor into the browser context
+        await this.injectPushInterceptor();
+    }
 
-      const originalPush = window.dataLayer.push;
+    /**
+     * Injects a wrapper for `window.dataLayer.push` that:
+     * - Makes sure the dataLayer is already defined
+     * - Sends each pushed value back to the Node (aka Playwright) context via `capturePush`
+     * - Prevents double-wrapping ==> Only want capture logic to run ONCE per actual push. Much like a real browser would :-)
+     */
+    async injectPushInterceptor() {
+        await this.page.evaluate(() => {
+            // Create the dataLayer array if it doesn't already exist
+            if (!window.dataLayer || !Array.isArray(window.dataLayer)) {
+                window.dataLayer = [];
+            }
 
-      if (!originalPush._intercepted) {
-        const wrappedPush = function () {
-          window.capturePush(...arguments);
-          return originalPush.apply(this, arguments);
-        };
-        wrappedPush._intercepted = true;
-        window.dataLayer.push = wrappedPush;
-      }
-    });
-  }
+            // Saving a reference to the original `push()` method before we overwrite it
+            const originalPush = window.dataLayer.push;
 
-  /**
-   * Call this after any navigation (click, goBack, etc.).
-   * It waits for the DOM and re-applies the dataLayer interception.
-   */
-  async afterNavigationEvent() {
-    await this.page.waitForLoadState('domcontentloaded');
-    await this.injectPushInterceptor();
-  }
+            // Only wrap once — trying to avoid breaking repeated calls... as this wouldn't do :-(
+            if (!originalPush._intercepted) {
+                const wrappedPush = function () {
+                    try {
+                        // Send pushed data back to the Playwright context
+                        window.capturePush(...arguments);
+                    } catch (err) {
+                        console.warn('[GTM Tracker] Failed to call capturePush:', err);
+                    }
 
-  /**
-   * Call this after navigating *back* to a page.
-   * It looks up the full URL, and re-pushes all events that were captured on that URL.
-   */
-  async restoreCurrentPageDataLayer() {
-    const url = this._getCurrentPageUrl();
-    const pushes = this.dataLayerHistory[url] || [];
+                    // Applying the original push logic
+                    return originalPush.apply(this, arguments);
+                };
 
-    await this.page.evaluate((storedPushes) => {
-      if (!window.dataLayer || !Array.isArray(window.dataLayer)) {
-        window.dataLayer = [];
-      }
-      storedPushes.forEach(event => window.dataLayer.push(event));
-    }, pushes);
-  }
+                // Mark this push as intercepted to avoid double-wrapping.
+                wrappedPush._intercepted = true;
+                window.dataLayer.push = wrappedPush;
+            }
+        });
+    }
 
-  /**
-   * Returns the full URL of the current page — including origin, pathname, and query string.
-   * Ensures each visited URL is uniquely identified in the history map.
-   */
-  _getCurrentPageUrl() {
-    const url = this.page.url(); // Full URL like "https://example.com/page1?foo=bar"
-    return url;
-  }
+    /**
+     * Called after every navigation event. For example, events like - (clicking a link, using `page.goBack()` or maybe `page.goto()`)
+     * It trys to ensure:
+     * - Page has finished loading
+     * - The push interceptor (aka `injectPushInterceptor`) is reinjected - (since new pages typically replace the context).... and we don't want that!
+     */
+    async afterNavigationEvent() {
+        // Wait for DOM to be ready
+        await this.page.waitForLoadState('domcontentloaded');
+
+        // Reinject the interceptor - (As JS context is usually reset on a navigation event)
+        await this.injectPushInterceptor();
+    }
+
+    /**
+     * After navigating back to a previously visited page, then this needs to happen:
+     * - Look up the pushes previously captured for that page
+     * - Re-push them to the live dataLayer
+     * - This mimics the effect of `bfcache` (aka 'Back-Forward Cache') restoring the memory state in 'real' browsers.
+     */
+    async restoreCurrentPageDataLayer() {
+        const url = this._getPagePathname(); // Pathname of the current page
+        const pushes = this.dataLayerHistory[url] || [];
+
+        // Re-populate the page's dataLayer with its previously recorded pushes
+        await this.page.evaluate((storedPushes) => {
+            if (!window.dataLayer || !Array.isArray(window.dataLayer)) {
+                window.dataLayer = [];
+            }
+
+            // Replay each captured event as if it had just been pushed
+            storedPushes.forEach(event => window.dataLayer.push(event));
+        }, pushes);
+    }
+
+    /**
+     * Small utility method to extract only the pathname from the current page URL
+     * - Helps keep URL handling consistent and avoids potential URL constructor pitfalls
+     */
+    _getPagePathname() {
+        try {
+            return new URL(this.page.url()).pathname;
+        } catch {
+            // fallback in case page.url() returns a malformed string
+            return '/';
+        }
+    }
 }
 
 module.exports = DataLayerTracker;
