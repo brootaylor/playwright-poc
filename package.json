@@ -1,0 +1,17 @@
+{
+  "name": "playwright-poc",
+  "version": "1.0.0",
+  "description": "Playwright POC example.",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "npx playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.53.0"
+  }
+}
